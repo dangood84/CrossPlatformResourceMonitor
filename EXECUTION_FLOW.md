@@ -8,7 +8,7 @@ One thread does everything:
 
 - **main** — flags, prime, sleep, collect, paint, poll
 
-There is no GUI thread and no worker. `collect_snapshot` and `printf` run on the same stack that called `main`.
+There is no GUI thread and no worker. `collect_snapshot` and `fwrite` of the composed frame run on the same stack that called `main`.
 
 ---
 
@@ -17,6 +17,8 @@ There is no GUI thread and no worker. `collect_snapshot` and `printf` run on the
 **1.** The OS loads `build/resource-monitor`. C runtime initialises. Static collector buffers (`g_cpu_all`, `g_net_rx`, …) are zero.
 
 **2.** `main` walks `argv`. No flags means: live mode, 1.0 s interval, Unicode bars, colour unless `NO_COLOR` is set.
+
+On **Linux**, if stdin, stdout, and stderr are all non-TTYs (file-manager click, `xdg-open`, macOS-style `open`) and `--once` was not passed, `linux_spawn_in_terminal` forks a terminal emulator and this process exits. The child has `RESOURCE_MONITOR_IN_TERM=1` and starts again at step 1 with a real TTY. That check runs **before** the prime sleep so a desktop click is not delayed by one interval.
 
 ```c
 /* src/monitor.c */
@@ -30,7 +32,7 @@ collect_snapshot(&snap);                 /* step 10 */
 
 **4.** `collect_init` (Darwin) zeroes the previous-tick structs and sets `g_primed = 0`.
 
-Windows: `collect_init` also `GetProcAddress`s `NtQuerySystemInformation` from `ntdll.dll` so a missing export falls back to a single `GetSystemTimes` bar.
+Windows: `collect_init` also looks up `NtQuerySystemInformation` in `ntdll.dll` (via a `FARPROC` union — MinGW rejects a direct cast) so a missing export falls back to a single `GetSystemTimes` bar.
 
 Linux: `collect_init` is the same zeroing; the files are opened later, per snapshot.
 
@@ -84,7 +86,7 @@ Linux at this step is `/proc/stat` `cpu` + `cpuN` lines (`idle+iowait` as idle).
 
 ## Phase D — paint (`--once` or first live frame)
 
-**13.** `--once`, `make once`, or a non-TTY stdout: `render_once` → `paint` → process exits. Terminal mode is unchanged. This is what `make test` is *not* — the test binary never calls `render_*` at all; it only asserts ranges and prints one `ok` line.
+**13.** `--once`, `make once`, or a non-TTY **stdout** (pipe / `less`): `render_once` → `paint` into a `FrameBuf` → one `fwrite` → process exits. Terminal mode is unchanged. A fully detached Linux GUI launch never reaches here; it was re-exec'd in step 2. This is what `make test` is *not* — the test binary never calls `render_*` at all; it only asserts ranges and prints one `ok` line.
 
 **14.** Live TTY: `term_init`:
 
@@ -102,7 +104,7 @@ Windows: `ENABLE_VIRTUAL_TERMINAL_PROCESSING`, UTF-8 `SetConsoleOutputCP`, conso
 ```
 term_size → opt.cols          /* TIOCGWINSZ, clamped 60..240 */
 if (!paused) collect_snapshot
-render_dashboard              /* \x1b[H\x1b[J + paint */
+render_dashboard              /* FrameBuf: \x1b[H + paint + \x1b[K/line + one fwrite + \x1b[J */
 key = term_poll_key(1000)
 ```
 
@@ -119,6 +121,8 @@ key = term_poll_key(1000)
 9. Footer: `q` / `space` / interval / local clock
 
 Bar fill is `round(pct / 100 * width)`. Colour: green `< 60`, yellow `< 85`, red otherwise. `--ascii` uses `#` / `.`.
+
+`paint` does **not** write to stdout as it goes. It appends to a `FrameBuf`. `render_dashboard` prefixes `\x1b[H`, suffixes `\x1b[J`, and `fwrite`s the lot. That is why cmd looks as still as bash: the console is unbuffered, but one write is one picture.
 
 **17.** `term_poll_key`: `poll(stdin, interval_ms)`.
 
@@ -140,8 +144,8 @@ main thread
   → collect_snapshot          (Mach / /proc / Win32)
         fill_* write ResourceSnapshot
   → render_dashboard
-        term_begin_frame (\x1b[H\x1b[J)
-        paint bars + numbers
+        FrameBuf: \x1b[H + bars + \x1b[K each line
+        one fwrite, then \x1b[J
   → term_poll_key(interval)
         q → restore → exit
         space → paused := !paused
@@ -170,6 +174,8 @@ Resize: no `SIGWINCH` handler. The next frame calls `term_size` again. A tester 
 2. `load_valid` stays 0; `paint` omits the Load columns.
 3. `term_poll_key` is `_kbhit` + `Sleep(20)` in a `GetTickCount` window. Arrow keys arrive as `0`/`224` + a follow-up; both are swallowed.
 4. 32-bit `dwInOctets` wrap → rate 0 for that tick (see WORKINGS.md).
+5. Drive and NIC names use `copy_trunc` (capped `memcpy`), not `snprintf("%s")`, so MinGW `-Wformat-truncation` stays quiet.
+6. Live paint is one `fwrite`. Do not expect a blank flash between ticks.
 
 Close the console window: the process dies; `atexit` still runs `term_restore` if `term_init` ran.
 
@@ -186,11 +192,15 @@ Close the console window: the process dies; `atexit` still runs `term_restore` i
 
 `make linux` on a Mac will compile `collect_linux.c` and then fail at run time if `/proc` is missing. Run that target **on Linux**.
 
+`posix_features.h` (first include) plus `-D_POSIX_C_SOURCE=200809L` is why `sigaction` / `nanosleep` / `gethostname` exist under `-std=c99`. Without it, the Pi compile stops with “storage size of `sa` isn’t known”.
+
+Desktop launch with no TTY is step 2, not a failed paint.
+
 ---
 
 ## One-line map
 
-`main` → `collect_init` → **snapshot (store counters)** → **sleep** → **snapshot (subtract)** → `term_init` → **collect → paint → poll** → `term_restore`.
+`main` → (Linux: maybe re-exec in a terminal) → `collect_init` → **snapshot (store counters)** → **sleep** → **snapshot (subtract)** → `term_init` → **collect → FrameBuf + fwrite → poll** → `term_restore`.
 
 Debugger: `main`, `collect_snapshot`, `fill_cpu`, `render_dashboard`, `term_poll_key`, `term_restore`. The first *visible* live frame is already the second sample; there is no "warming up" line unless you breakpoint before the prime sleep and force a paint.
 

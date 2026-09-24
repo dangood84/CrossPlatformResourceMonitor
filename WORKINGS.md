@@ -12,15 +12,16 @@ This is a **timed loop**, not a GUI event loop like Goody's Calculator. Nothing 
 
 ```
 monitor.c main
+  → [Linux, no TTY at all] re-exec in lxterminal / xterm, exit
   → collect_init                  # one of collect_darwin / linux / win
   → collect_snapshot              # prime: store counters, rates are junk
   → sleep(interval)
   → collect_snapshot              # now CPU % and B/s are real
-  → if --once or not a TTY: print once, exit
+  → if --once or stdout not a TTY: print once, exit
   → term_init (alt screen, raw stdin)
        loop
            collect_snapshot       # unless paused
-           render_dashboard
+           render_dashboard       # one fwrite (home + frame + [J])
            term_poll_key(interval)
            q / Ctrl+C → restore terminal, exit
 ```
@@ -64,7 +65,7 @@ else {
 5. **`util_sleep_ms`** waits one interval. `nanosleep` is restarted on `EINTR` so a stray signal does not shorten the prime.
 6. **Second `collect_snapshot`** subtracts Mach tick counters and interface byte counters. `primed` is 1. `sample_dt` is the real elapsed time (about 1.0 s, or 0.25 s under `make test`).
 7. Live mode: **`term_init`** switches the TTY to non-canonical input, hides the cursor, and enters the alternate screen. `atexit` + `SIGINT` both call `term_restore`.
-8. Each loop iteration: optional collect, `render_dashboard` (`\x1b[H\x1b[J` + paint), `term_poll_key` for up to one interval.
+8. Each loop iteration: optional collect, `render_dashboard` (compose a `FrameBuf`, `\x1b[H`, `\x1b[K` per line, one `fwrite`, then `\x1b[J`), `term_poll_key` for up to one interval.
 9. **`q`**, Ctrl+C, or `SIGTERM`: restore the previous screen and cooked input, then `collect_shutdown`.
 
 ### Two user journeys
@@ -85,6 +86,8 @@ prime → sleep → snapshot → term_init → (collect → paint → poll)* →
 
 `space` flips `paused`. Collection stops; the last snapshot is redrawn so the footer can still show `PAUSED`.
 
+**Linux desktop / `open` / `xdg-open`:** stdin, stdout, and stderr are all non-TTYs. `linux_spawn_in_terminal` forks `x-terminal-emulator` / `lxterminal` / `xterm` with `RESOURCE_MONITOR_IN_TERM=1` so the child is the live dashboard. `open` is still a macOS command; the right invocation from a Pi shell is `./build/resource-monitor`.
+
 ### Why testers care
 
 - **Compile-time host is the feature flag.** Automating "Mac numbers" vs "Linux numbers" is `make` vs `make linux` on that machine, not a CLI switch.
@@ -102,9 +105,14 @@ This is a **separation of snapshot vs paint**, not a framework.
 ### `monitor.c` — composition root
 
 - Parses flags
+- On Linux, if every stdio fd is detached, opens a real terminal and re-execs
 - Primes the collector
 - Owns the pause flag and the stop signal
 - Does **not** read `/proc` or Mach itself
+
+### `posix_features.h` — glibc C99
+
+Must be the **first** include on Linux. `-std=c99` hides `sigaction`, `nanosleep`, `clock_gettime`, and `gethostname` unless `_DEFAULT_SOURCE` / `_POSIX_C_SOURCE` are set *before* any system header. The macros are Linux-only: the same defines on Darwin can hide `getifaddrs`.
 
 ### `snapshot.h` — the contract
 
@@ -134,6 +142,7 @@ That is why `monitortest.c` can link `util.c` + one collector and never mention 
 - Green < 60%, yellow < 85%, red otherwise
 - Hides NICs whose lifetime counters are still zero, unless *every* NIC is zero
 - `--ascii` swaps `█░` for `#.`
+- Live frames are a `FrameBuf`: home, erase-to-end-of-line on each row, **one** `fwrite`. cmd.exe (and the MinGW CRT) leave the console unbuffered, so a leading `\x1b[J` plus line-by-line `printf` used to flash every second. Unix TTYs hid that because stdio only flushed at the end.
 
 It does not know about Mach or `/proc`.
 
@@ -234,7 +243,7 @@ Two kinds of state matter:
 | `term_poll_key` | nothing | no |
 | space key | `paused` in `main` | no (next paint shows `PAUSED`) |
 
-A tester debugging "CPU is always 0" should breakpoint the second `collect_snapshot` and watch `g_primed`. A tester debugging "the window is blank" should breakpoint `render_dashboard` / `term_begin_frame`. A tester debugging "q does nothing" should breakpoint `term_poll_key` and check that `ICANON` is off. A tester debugging "my shell is broken after Ctrl+C" should breakpoint `term_restore`.
+A tester debugging "CPU is always 0" should breakpoint the second `collect_snapshot` and watch `g_primed`. A tester debugging "the window is blank" should breakpoint `render_dashboard` / `fb_flush`. A tester debugging "cmd flashes every second" should confirm the live path is `FrameBuf` + one `fwrite`, not `\x1b[J` then `printf`. A tester debugging "q does nothing" should breakpoint `term_poll_key` and check that `ICANON` is off. A tester debugging "my shell is broken after Ctrl+C" should breakpoint `term_restore`. A tester debugging "Linux double-click does nothing" should breakpoint `linux_spawn_in_terminal`.
 
 ### Why not `sleep(1)` then `scanf`?
 
@@ -246,13 +255,14 @@ A blocking `fgets` would make the dashboard freeze until Enter. A blocking `slee
 
 ```
 src/
-  monitor.c           # main, flags, prime, loop
+  monitor.c           # main, flags, Linux no-TTY re-exec, prime, loop
   snapshot.h          # ResourceSnapshot
   collect.h           # host API
   collect_darwin.c    # Mach / sysctl / IOKit
   collect_linux.c     # /proc / sysfs
   collect_win.c       # Win32 / PDH-free
-  render.c            # bars, colours, idle-NIC filter
+  posix_features.h    # first include on Linux (glibc C99)
+  render.c            # bars, FrameBuf, idle-NIC filter
   term.c              # alt screen, raw, poll
   util.c              # sleep, KiB labels, NO_COLOR
   monitortest.c       # make test

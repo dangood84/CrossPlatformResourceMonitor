@@ -98,6 +98,8 @@ build/resource-monitor
 
 Piped to a file or to `less`, the process behaves like `--once` even without the flag. A live loop in a non-TTY is the wrong tool.
 
+On **Windows cmd**, live frames are composed in memory and written once. Classic cmd is unbuffered, so the old “erase, then `printf` each line” path flashed every second. Windows Terminal is fine either way; `ResourceMonitor.exe` should now sit still in both.
+
 ## Where it appears
 
 | OS | Collector | What you see |
@@ -118,7 +120,8 @@ src/
   collect_darwin.c    # macOS host
   collect_linux.c     # Linux host
   collect_win.c       # Windows host
-  render.c            # ANSI dashboard
+  posix_features.h    # glibc C99: expose sigaction / nanosleep / gethostname
+  render.c            # ANSI dashboard (one fwrite per live frame)
   term.c              # raw mode, alt screen, key poll
   util.c              # sleep, byte/rate/uptime formatting
   monitortest.c       # make test
