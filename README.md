@@ -27,11 +27,13 @@ macOS (Xcode command-line tools, already enough):
 xcode-select --install   # only if `cc` is missing
 ```
 
-Debian / Raspberry Pi OS:
+Debian / Raspberry Pi OS (build **on** the Pi, not from macOS):
 
 ```bash
 sudo apt install build-essential
 ```
+
+`make` or `make linux` both work there. glibc hides POSIX APIs under strict `-std=c99`; `src/posix_features.h` asks for them (`sigaction`, `nanosleep`, `gethostname`).
 
 Windows: MinGW-w64, MSYS2, or any `gcc` that can see `windows.h`, `psapi`, and `iphlpapi`.
 

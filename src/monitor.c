@@ -1,3 +1,4 @@
+#include "posix_features.h"
 #include "collect.h"
 #include "render.h"
 #include "term.h"

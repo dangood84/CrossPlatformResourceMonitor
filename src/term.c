@@ -1,3 +1,4 @@
+#include "posix_features.h"
 #include "term.h"
 #include "util.h"
 

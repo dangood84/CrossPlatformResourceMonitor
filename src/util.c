@@ -1,3 +1,4 @@
+#include "posix_features.h"
 #include "util.h"
 
 #include <stdio.h>

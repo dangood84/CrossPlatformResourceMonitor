@@ -20,7 +20,9 @@ ifeq ($(UNAME_S),Darwin)
 endif
 ifeq ($(UNAME_S),Linux)
   COLLECT  := $(SRC)/collect_linux.c
-  LDLIBS   :=
+  # glibc hid POSIX under -std=c99; posix_features.h also sets these.
+  CFLAGS   += -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L
+  LDLIBS   := -lrt
 endif
 ifneq (,$(findstring MINGW,$(UNAME_S)))
   COLLECT  := $(SRC)/collect_win.c
@@ -57,9 +59,10 @@ test: $(BUILD)/monitortest
 
 # Explicit host targets (run these on that OS; they do not cross-compile).
 linux: $(BUILD)
-	$(CC) $(CFLAGS) -o $(BUILD)/resource-monitor \
+	$(CC) $(CFLAGS) -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L \
+	    -o $(BUILD)/resource-monitor \
 	    $(SRC)/monitor.c $(SRC)/util.c $(SRC)/term.c $(SRC)/render.c \
-	    $(SRC)/collect_linux.c
+	    $(SRC)/collect_linux.c -lrt
 
 windows: $(BUILD)
 	$(CC) $(CFLAGS) -o $(BUILD)/ResourceMonitor.exe \
