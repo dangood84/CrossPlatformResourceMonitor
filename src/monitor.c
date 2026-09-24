@@ -12,6 +12,11 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <unistd.h>
+#endif
+#ifdef __linux__
+#include <limits.h>
 #endif
 
 /* WORKING: SIGINT/SIGTERM must not leave the terminal in raw mode or
@@ -42,6 +47,50 @@ static void usage(FILE *out)
         "\n"
         "See README.md, WORKINGS.md, and EXECUTION_FLOW.md.\n");
 }
+
+#ifdef __linux__
+/* WORKING: `open` is a macOS command. On the Pi, xdg-open / a file-manager
+ * double-click starts this binary with no controlling terminal. The live
+ * dashboard needs a TTY, so without help it primed, printed one frame to
+ * nowhere, and exited — "nothing happens".
+ *
+ * If stdin/stdout/stderr are all non-TTYs and the user did not pass
+ * --once, open a real terminal emulator and re-exec ourselves. The env
+ * var stops a fork bomb if the child is still detached. */
+static int linux_spawn_in_terminal(const char *argv0)
+{
+    char self[PATH_MAX];
+    const char *path = argv0;
+    ssize_t n;
+    pid_t pid;
+
+    if (getenv("RESOURCE_MONITOR_IN_TERM") != NULL) {
+        return -1;
+    }
+
+    n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (n > 0) {
+        self[n] = '\0';
+        path = self;
+    }
+    if (path == NULL || path[0] == '\0') {
+        return -1;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        setenv("RESOURCE_MONITOR_IN_TERM", "1", 1);
+        execlp("x-terminal-emulator", "x-terminal-emulator", "-e", path, (char *)NULL);
+        execlp("lxterminal", "lxterminal", "-e", path, (char *)NULL);
+        execlp("xterm", "xterm", "-e", path, (char *)NULL);
+        _exit(127);
+    }
+    return 0;
+}
+#endif
 
 static double parse_interval(const char *s)
 {
@@ -91,6 +140,23 @@ int main(int argc, char **argv)
     if (util_nocolor_requested()) {
         color = 0;
     }
+
+#ifdef __linux__
+    if (!once &&
+        !isatty(STDIN_FILENO) &&
+        !isatty(STDOUT_FILENO) &&
+        !isatty(STDERR_FILENO)) {
+        if (linux_spawn_in_terminal(argc > 0 ? argv[0] : NULL) == 0) {
+            return 0;
+        }
+        fprintf(stderr,
+                "resource-monitor: this is a terminal dashboard.\n"
+                "Run it from a terminal, not with 'open' or a silent GUI click:\n"
+                "  ./build/resource-monitor\n"
+                "  ./build/resource-monitor --once\n");
+        return 1;
+    }
+#endif
 
     if (collect_init() != 0) {
         fprintf(stderr, "collect_init failed on %s\n", collect_host_name());
@@ -143,7 +209,14 @@ int main(int argc, char **argv)
 
     if (!term_is_tty()) {
         /* WORKING: piped to a file or `less`, a live alt-screen loop is
-         * the wrong tool. Print one framed snapshot the way --once does. */
+         * the wrong tool. Print one framed snapshot the way --once does.
+         * A fully detached GUI launch is handled earlier on Linux. */
+        if (!once) {
+            fprintf(stderr,
+                    "resource-monitor: no TTY on stdout; printing one snapshot.\n"
+                    "For the live dashboard run this in a terminal:\n"
+                    "  ./build/resource-monitor\n");
+        }
         render_once(&snap, &opt);
         collect_shutdown();
         return 0;

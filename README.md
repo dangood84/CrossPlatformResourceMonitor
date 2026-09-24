@@ -48,6 +48,16 @@ make run
 
 That compiles to `build/resource-monitor` and opens the live dashboard. `q` quits; space pauses.
 
+On **Linux / Raspberry Pi OS**, run the binary from a terminal. `open` is a macOS command; on the Pi it (or a file-manager double-click) starts the process with no TTY, so the live UI has nowhere to draw.
+
+```bash
+./build/resource-monitor          # live dashboard (this window)
+./build/resource-monitor --once   # one snapshot, then back to the prompt
+make run
+```
+
+If you do click the binary on the desktop, it now tries to open `x-terminal-emulator` / `lxterminal` / `xterm` for you.
+
 Or with Make on other OSes:
 
 ```bash
