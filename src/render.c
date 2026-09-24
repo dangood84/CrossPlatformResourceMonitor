@@ -3,6 +3,7 @@
 #include "term.h"
 #include "util.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -14,6 +15,80 @@ static const char *C_GREEN = "\x1b[32m";
 static const char *C_YELL  = "\x1b[33m";
 static const char *C_RED   = "\x1b[31m";
 static const char *C_CYAN  = "\x1b[36m";
+
+/* WORKING: cmd.exe (and the MinGW CRT) treat a console as unbuffered, so
+ * each fprintf("...\n") hits the glass immediately. Combined with a
+ * leading \x1b[J (erase display) you see: blank flash, then the dashboard
+ * painted top-to-bottom, every second. Unix TTYs keep the writes in a
+ * stdio buffer until fflush, which is why the Pi and the Mac look still.
+ *
+ * Fix: build the whole frame in memory and fwrite it once. Live mode
+ * homes the cursor and clears each line with \x1b[K instead of wiping
+ * the screen first. */
+#define FRAME_CAP 24576
+
+typedef struct {
+    char   data[FRAME_CAP];
+    size_t len;
+    int    live; /* 1: \x1b[K before newline so leftover glyphs vanish */
+} FrameBuf;
+
+static void fb_add(FrameBuf *fb, const char *s)
+{
+    size_t n;
+    size_t room;
+
+    if (s == NULL || fb->len + 1 >= FRAME_CAP) {
+        return;
+    }
+    n = strlen(s);
+    room = FRAME_CAP - 1 - fb->len;
+    if (n > room) {
+        n = room;
+    }
+    memcpy(fb->data + fb->len, s, n);
+    fb->len += n;
+    fb->data[fb->len] = '\0';
+}
+
+static void fb_addch(FrameBuf *fb, int c)
+{
+    if (fb->len + 1 >= FRAME_CAP) {
+        return;
+    }
+    fb->data[fb->len++] = (char)c;
+    fb->data[fb->len] = '\0';
+}
+
+static void fb_printf(FrameBuf *fb, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    size_t room = FRAME_CAP - 1 - fb->len;
+
+    if (room == 0) {
+        return;
+    }
+    va_start(ap, fmt);
+    n = vsnprintf(fb->data + fb->len, room + 1, fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        if ((size_t)n > room) {
+            fb->len += room;
+        } else {
+            fb->len += (size_t)n;
+        }
+    }
+}
+
+static void fb_nl(FrameBuf *fb)
+{
+    /* Erase-to-end-of-line, then newline. Overwrite-in-place, no flash. */
+    if (fb->live) {
+        fb_add(fb, "\x1b[K");
+    }
+    fb_addch(fb, '\n');
+}
 
 static const char *pct_color(double pct, int color)
 {
@@ -34,7 +109,7 @@ static const char *s(const RenderOptions *opt, const char *code)
     return opt->color ? code : "";
 }
 
-static void bar(FILE *out, const RenderOptions *opt, double pct, int width)
+static void bar(FrameBuf *fb, const RenderOptions *opt, double pct, int width)
 {
     const char *on;
     const char *off;
@@ -56,16 +131,16 @@ static void bar(FILE *out, const RenderOptions *opt, double pct, int width)
     off = opt->ascii ? "." : "\xE2\x96\x91";  /* ░ */
     col = pct_color(pct, opt->color);
 
-    fputs(col, out);
-    fputc('[', out);
+    fb_add(fb, col);
+    fb_addch(fb, '[');
     for (i = 0; i < filled; i++) {
-        fputs(on, out);
+        fb_add(fb, on);
     }
     for (i = filled; i < width; i++) {
-        fputs(off, out);
+        fb_add(fb, off);
     }
-    fputc(']', out);
-    fputs(s(opt, C_RESET), out);
+    fb_addch(fb, ']');
+    fb_add(fb, s(opt, C_RESET));
 }
 
 static double used_pct(uint64_t used, uint64_t total)
@@ -76,16 +151,16 @@ static double used_pct(uint64_t used, uint64_t total)
     return util_clamp_pct(100.0 * (double)used / (double)total);
 }
 
-static void hline(FILE *out, const RenderOptions *opt, int cols)
+static void hline(FrameBuf *fb, const RenderOptions *opt, int cols)
 {
     int i;
     const char *ch = opt->ascii ? "-" : "\xE2\x94\x80"; /* ─ */
-    fputs(s(opt, C_DIM), out);
+    fb_add(fb, s(opt, C_DIM));
     for (i = 0; i < cols; i++) {
-        fputs(ch, out);
+        fb_add(fb, ch);
     }
-    fputs(s(opt, C_RESET), out);
-    fputc('\n', out);
+    fb_add(fb, s(opt, C_RESET));
+    fb_nl(fb);
 }
 
 static int main_bar_width(int cols)
@@ -101,7 +176,7 @@ static int mini_bar_width(int cols)
     return 8;
 }
 
-static void paint(FILE *out, const ResourceSnapshot *snap, const RenderOptions *opt)
+static void paint(FrameBuf *fb, const ResourceSnapshot *snap, const RenderOptions *opt)
 {
     char b1[64], b2[64], b3[64], when[64];
     time_t now;
@@ -120,86 +195,93 @@ static void paint(FILE *out, const ResourceSnapshot *snap, const RenderOptions *
         snprintf(when, sizeof(when), "--");
     }
 
-    fputs(s(opt, C_BOLD), out);
-    fputs("  Cross-Platform Resource Monitor", out);
-    fputs(s(opt, C_RESET), out);
+    fb_add(fb, s(opt, C_BOLD));
+    fb_add(fb, "  Cross-Platform Resource Monitor");
+    fb_add(fb, s(opt, C_RESET));
     if (opt->paused) {
-        fputs(s(opt, C_YELL), out);
-        fputs("   PAUSED", out);
-        fputs(s(opt, C_RESET), out);
+        fb_add(fb, s(opt, C_YELL));
+        fb_add(fb, "   PAUSED");
+        fb_add(fb, s(opt, C_RESET));
     }
-    fputc('\n', out);
+    fb_nl(fb);
 
-    fprintf(out, "  %s%s%s  ·  %s %s  ·  %s  ·  %d cores\n",
-            s(opt, C_CYAN),
-            snap->hostname[0] ? snap->hostname : "unknown",
-            s(opt, C_RESET),
-            snap->host_label[0] ? snap->host_label : snap->os_name,
-            snap->os_release,
-            snap->arch,
-            snap->cpu_count);
-    hline(out, opt, cols);
+    fb_printf(fb, "  %s%s%s  ·  %s %s  ·  %s  ·  %d cores",
+              s(opt, C_CYAN),
+              snap->hostname[0] ? snap->hostname : "unknown",
+              s(opt, C_RESET),
+              snap->host_label[0] ? snap->host_label : snap->os_name,
+              snap->os_release,
+              snap->arch,
+              snap->cpu_count);
+    fb_nl(fb);
+    hline(fb, opt, cols);
 
     /* --- CPU --- */
-    fputs("  CPU     ", out);
+    fb_add(fb, "  CPU     ");
     if (!snap->primed || snap->cpu_total < 0.0) {
-        fputs(s(opt, C_DIM), out);
-        fputs("(warming up — rates need two samples)\n", out);
-        fputs(s(opt, C_RESET), out);
+        fb_add(fb, s(opt, C_DIM));
+        fb_add(fb, "(warming up — rates need two samples)");
+        fb_add(fb, s(opt, C_RESET));
+        fb_nl(fb);
     } else {
-        bar(out, opt, snap->cpu_total, bw);
-        fprintf(out, "  %5.1f%%\n", snap->cpu_total);
+        bar(fb, opt, snap->cpu_total, bw);
+        fb_printf(fb, "  %5.1f%%", snap->cpu_total);
+        fb_nl(fb);
     }
 
     if (snap->core_count > 0 && snap->primed) {
         int per_line = (cols >= 100) ? 4 : (cols >= 80 ? 3 : 2);
         int col = 0;
-        fputs("  ", out);
+        fb_add(fb, "  ");
         for (i = 0; i < snap->core_count; i++) {
-            fprintf(out, "%2s ", snap->cores[i].name);
-            bar(out, opt, snap->cores[i].usage, mw);
-            fprintf(out, " %4.0f%%", snap->cores[i].usage);
+            fb_printf(fb, "%2s ", snap->cores[i].name);
+            bar(fb, opt, snap->cores[i].usage, mw);
+            fb_printf(fb, " %4.0f%%", snap->cores[i].usage);
             col++;
             if (col >= per_line || i + 1 == snap->core_count) {
-                fputc('\n', out);
+                fb_nl(fb);
                 if (i + 1 < snap->core_count) {
-                    fputs("  ", out);
+                    fb_add(fb, "  ");
                 }
                 col = 0;
             } else {
-                fputs("   ", out);
+                fb_add(fb, "   ");
             }
         }
     }
-    fputc('\n', out);
+    fb_nl(fb);
 
     /* --- Memory --- */
     mpct = used_pct(snap->mem_used, snap->mem_total);
     util_format_bytes(snap->mem_used, b1, sizeof(b1));
     util_format_bytes(snap->mem_total, b2, sizeof(b2));
-    fputs("  Memory  ", out);
-    bar(out, opt, mpct, bw);
-    fprintf(out, "  %s / %s  (%4.1f%%)\n", b1, b2, mpct);
+    fb_add(fb, "  Memory  ");
+    bar(fb, opt, mpct, bw);
+    fb_printf(fb, "  %s / %s  (%4.1f%%)", b1, b2, mpct);
+    fb_nl(fb);
 
     if (snap->swap_total > 0) {
         spct = used_pct(snap->swap_used, snap->swap_total);
         util_format_bytes(snap->swap_used, b1, sizeof(b1));
         util_format_bytes(snap->swap_total, b2, sizeof(b2));
-        fputs("  Swap    ", out);
-        bar(out, opt, spct, bw);
-        fprintf(out, "  %s / %s  (%4.1f%%)\n", b1, b2, spct);
+        fb_add(fb, "  Swap    ");
+        bar(fb, opt, spct, bw);
+        fb_printf(fb, "  %s / %s  (%4.1f%%)", b1, b2, spct);
+        fb_nl(fb);
     } else {
-        fputs(s(opt, C_DIM), out);
-        fputs("  Swap    none\n", out);
-        fputs(s(opt, C_RESET), out);
+        fb_add(fb, s(opt, C_DIM));
+        fb_add(fb, "  Swap    none");
+        fb_add(fb, s(opt, C_RESET));
+        fb_nl(fb);
     }
-    fputc('\n', out);
+    fb_nl(fb);
 
     /* --- Disks --- */
     if (snap->disk_count == 0) {
-        fputs(s(opt, C_DIM), out);
-        fputs("  Disk    (none reported)\n", out);
-        fputs(s(opt, C_RESET), out);
+        fb_add(fb, s(opt, C_DIM));
+        fb_add(fb, "  Disk    (none reported)");
+        fb_add(fb, s(opt, C_RESET));
+        fb_nl(fb);
     }
     for (i = 0; i < snap->disk_count; i++) {
         double dp = used_pct(snap->disks[i].used_bytes, snap->disks[i].total_bytes);
@@ -207,12 +289,13 @@ static void paint(FILE *out, const ResourceSnapshot *snap, const RenderOptions *
         snprintf(mount, sizeof(mount), "%s", snap->disks[i].mount);
         util_format_bytes(snap->disks[i].used_bytes, b1, sizeof(b1));
         util_format_bytes(snap->disks[i].total_bytes, b2, sizeof(b2));
-        fprintf(out, "  Disk %-18s ", mount);
-        bar(out, opt, dp, util_clamp_int(bw - 10, 10, 40));
-        fprintf(out, "  %s / %s  %s%s%s\n",
-                b1, b2, s(opt, C_DIM), snap->disks[i].fstype, s(opt, C_RESET));
+        fb_printf(fb, "  Disk %-18s ", mount);
+        bar(fb, opt, dp, util_clamp_int(bw - 10, 10, 40));
+        fb_printf(fb, "  %s / %s  %s%s%s",
+                  b1, b2, s(opt, C_DIM), snap->disks[i].fstype, s(opt, C_RESET));
+        fb_nl(fb);
     }
-    fputc('\n', out);
+    fb_nl(fb);
 
     /* --- Network --- */
     {
@@ -234,69 +317,92 @@ static void paint(FILE *out, const ResourceSnapshot *snap, const RenderOptions *
             }
             util_format_rate(snap->nets[i].rx_bps, b1, sizeof(b1));
             util_format_rate(snap->nets[i].tx_bps, b2, sizeof(b2));
-            fprintf(out, "  Net  %-8s   %s↓%s %-10s    %s↑%s %s\n",
-                    snap->nets[i].name,
-                    s(opt, C_CYAN), s(opt, C_RESET), b1,
-                    s(opt, C_YELL), s(opt, C_RESET), b2);
+            fb_printf(fb, "  Net  %-8s   %s↓%s %-10s    %s↑%s %s",
+                      snap->nets[i].name,
+                      s(opt, C_CYAN), s(opt, C_RESET), b1,
+                      s(opt, C_YELL), s(opt, C_RESET), b2);
+            fb_nl(fb);
             shown++;
         }
         if (shown == 0) {
-            fputs(s(opt, C_DIM), out);
-            fputs("  Net     (no active interfaces)\n", out);
-            fputs(s(opt, C_RESET), out);
+            fb_add(fb, s(opt, C_DIM));
+            fb_add(fb, "  Net     (no active interfaces)");
+            fb_add(fb, s(opt, C_RESET));
+            fb_nl(fb);
         }
     }
-    fputc('\n', out);
+    fb_nl(fb);
 
     /* --- Footer facts --- */
     util_format_uptime(snap->uptime_sec, b1, sizeof(b1));
     if (snap->load_valid) {
-        fprintf(out, "  Load  %5.2f  %5.2f  %5.2f     Processes  %-5u     Up  %s\n",
-                snap->load1, snap->load5, snap->load15,
-                (unsigned)snap->process_count, b1);
+        fb_printf(fb, "  Load  %5.2f  %5.2f  %5.2f     Processes  %-5u     Up  %s",
+                  snap->load1, snap->load5, snap->load15,
+                  (unsigned)snap->process_count, b1);
+        fb_nl(fb);
     } else {
-        fprintf(out, "  Processes  %-5u     Up  %s\n",
-                (unsigned)snap->process_count, b1);
+        fb_printf(fb, "  Processes  %-5u     Up  %s",
+                  (unsigned)snap->process_count, b1);
+        fb_nl(fb);
     }
 
     if (snap->battery_present) {
         double bp = snap->battery_percent >= 0 ? (double)snap->battery_percent : 0.0;
-        fputs("  Battery ", out);
+        fb_add(fb, "  Battery ");
         if (snap->battery_percent >= 0) {
-            bar(out, opt, bp, 12);
-            fprintf(out, "  %3d%%", snap->battery_percent);
+            bar(fb, opt, bp, 12);
+            fb_printf(fb, "  %3d%%", snap->battery_percent);
         } else {
-            fputs(s(opt, C_DIM), out);
-            fputs("  unknown %", out);
-            fputs(s(opt, C_RESET), out);
+            fb_add(fb, s(opt, C_DIM));
+            fb_add(fb, "  unknown %");
+            fb_add(fb, s(opt, C_RESET));
         }
         if (snap->battery_charging) {
-            fputs("  charging", out);
+            fb_add(fb, "  charging");
         } else if (snap->battery_plugged) {
-            fputs("  on AC", out);
+            fb_add(fb, "  on AC");
         } else {
-            fputs("  on battery", out);
+            fb_add(fb, "  on battery");
         }
-        fputc('\n', out);
+        fb_nl(fb);
     }
 
-    hline(out, opt, cols);
+    hline(fb, opt, cols);
     snprintf(b3, sizeof(b3), "%.1fs", opt->interval_sec);
-    fprintf(out, "  %sq%s quit   %sspace%s pause   refresh %s          %s\n",
-            s(opt, C_BOLD), s(opt, C_RESET),
-            s(opt, C_BOLD), s(opt, C_RESET),
-            b3, when);
+    fb_printf(fb, "  %sq%s quit   %sspace%s pause   refresh %s          %s",
+              s(opt, C_BOLD), s(opt, C_RESET),
+              s(opt, C_BOLD), s(opt, C_RESET),
+              b3, when);
+    fb_nl(fb);
+}
+
+static void fb_flush(const FrameBuf *fb)
+{
+    if (fb->len > 0) {
+        fwrite(fb->data, 1, fb->len, stdout);
+        fflush(stdout);
+    }
 }
 
 void render_dashboard(const ResourceSnapshot *snap, const RenderOptions *opt)
 {
-    term_begin_frame();
-    paint(stdout, snap, opt);
-    fflush(stdout);
+    FrameBuf fb;
+
+    memset(&fb, 0, sizeof(fb));
+    fb.live = 1;
+    /* Home only — do not erase the display first (that is the cmd flash). */
+    fb_add(&fb, "\x1b[H");
+    paint(&fb, snap, opt);
+    fb_add(&fb, "\x1b[J");
+    fb_flush(&fb);
 }
 
 void render_once(const ResourceSnapshot *snap, const RenderOptions *opt)
 {
-    paint(stdout, snap, opt);
-    fflush(stdout);
+    FrameBuf fb;
+
+    memset(&fb, 0, sizeof(fb));
+    fb.live = 0;
+    paint(&fb, snap, opt);
+    fb_flush(&fb);
 }

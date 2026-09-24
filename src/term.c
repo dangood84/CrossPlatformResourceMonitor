@@ -208,6 +208,7 @@ void term_size(int *cols, int *rows)
 
 void term_begin_frame(void)
 {
-    /* Home + clear-down. Cheaper than a full 2J and avoids flicker. */
-    fputs("\x1b[H\x1b[J", stdout);
+    /* Home only. Erasing the display here flashes on Windows cmd
+     * (see render.c). Live frames are composed off-screen instead. */
+    fputs("\x1b[H", stdout);
 }
