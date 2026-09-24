@@ -48,6 +48,29 @@ const char *collect_host_name(void)
     return "Windows";
 }
 
+static void copy_trunc(char *dst, size_t n, const char *src)
+{
+    /* WORKING: MinGW's -Wformat-truncation fires on snprintf("%s") when
+     * the source is a slice of a bigger buffer (GetLogicalDriveStrings
+     * is 512 bytes; mount is 128). The real strings are "C:\\". This
+     * copy is explicit about the cap and does not go through printf. */
+    if (dst == NULL || n == 0) {
+        return;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+    {
+        size_t len = strlen(src);
+        if (len >= n) {
+            len = n - 1;
+        }
+        memcpy(dst, src, len);
+        dst[len] = '\0';
+    }
+}
+
 int collect_init(void)
 {
     HMODULE ntdll;
@@ -58,11 +81,23 @@ int collect_init(void)
     g_last_t = 0.0;
     /* WORKING: NtQuerySystemInformation is the documented way to get
      * per-CPU idle/kernel/user times. It lives in ntdll; we look it up
-     * so a missing export falls back to GetSystemTimes (one bar). */
+     * so a missing export falls back to GetSystemTimes (one bar).
+     *
+     * GetProcAddress returns FARPROC. MinGW -Wcast-function-type will
+     * not accept a direct cast to our prototype (different return
+     * width on x64). A union is the usual way to re-type the pointer
+     * without that warning. */
     ntdll = GetModuleHandleA("ntdll.dll");
     if (ntdll != NULL) {
-        g_ntqsi = (NtQuerySystemInformation_fn)
-            GetProcAddress(ntdll, "NtQuerySystemInformation");
+        FARPROC raw = GetProcAddress(ntdll, "NtQuerySystemInformation");
+        if (raw != NULL) {
+            union {
+                FARPROC raw;
+                NtQuerySystemInformation_fn fn;
+            } u;
+            u.raw = raw;
+            g_ntqsi = u.fn;
+        }
     }
     return 0;
 }
@@ -240,10 +275,10 @@ static void fill_disks(ResourceSnapshot *out)
         if (total.QuadPart == 0) {
             continue;
         }
-        snprintf(out->disks[out->disk_count].mount,
-                 sizeof(out->disks[out->disk_count].mount), "%s", d);
-        snprintf(out->disks[out->disk_count].fstype,
-                 sizeof(out->disks[out->disk_count].fstype), "ntfs");
+        copy_trunc(out->disks[out->disk_count].mount,
+                   sizeof(out->disks[out->disk_count].mount), d);
+        copy_trunc(out->disks[out->disk_count].fstype,
+                   sizeof(out->disks[out->disk_count].fstype), "ntfs");
         out->disks[out->disk_count].total_bytes = (uint64_t)total.QuadPart;
         out->disks[out->disk_count].used_bytes =
             (uint64_t)(total.QuadPart - total_free.QuadPart);
@@ -298,7 +333,7 @@ static void fill_net(ResourceSnapshot *out, double dt)
         if (row->dwType == IF_TYPE_SOFTWARE_LOOPBACK) {
             continue;
         }
-        snprintf(name, sizeof(name), "%s", (char *)row->bDescr);
+        copy_trunc(name, sizeof(name), (const char *)row->bDescr);
         if (skip_iface(name)) {
             continue;
         }
